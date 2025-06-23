@@ -1,2 +1,7 @@
 --target=/usr/local/sbin
---ignore='\.(?!sh$)[^.]+$'
+--ignore='\.(?!(ba|z)?sh$)[^.]*$'
+# Ignora tutto tranne script shell
+#--adopt='\.sh$'
+#--adopt='\.bash$' 
+#--adopt='\.zsh$'
+#--ignore='.*'
