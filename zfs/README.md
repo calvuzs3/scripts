@@ -1,4 +1,254 @@
-# ZFS Management Script
+# ZFS + ZFSBootMenu Setup Guide
+
+Lascio questa sezione introduttiva perchè hoa avuto non pochi problemi a settare un ambiente sicuro di test con zfs, e non vorrei incorrere negli stessi problemi.
+La situazione iniziale vedeva la EFI partition, montata in /boot, e chiaramente popolata da tutto l'albero tipico del boot, compresi il kernel e la ramfs. Questo perchè era una cosa sicura da fare, per la fase boot, giacchè refind non legge nativamente da zfs. Lo svantaggio era che si necessitava di una partizione sufficientemente grande per poter contenere diversi kernel e diverse ram, ciascuna da nomnclare, ciascuna da caricare a seconda del boot necessario.
+Durante questa avventura, ho ristrutturato il mio albero, ponendo /boot nel rootfs, cosicche un solo volume viene montato, non serve una nomenclatura dedicata, non serve una configurazione ad hoc per ogni nome kernel. La partizione efi montata in /boot/efi. Per precauzione iniziale (ed ha funzionato, salvando il sistema), una copia del kernel e della ram e dell'intel ucode, posti nella root della partizione EFI; questo ha permesso di bootare da una configurazione refind funzionante.
+
+## Transizione a ZFSBootMenu
+
+   Il sistema è stato migrato da rEFInd + Boot Environments a **ZFSBootMenu** per una gestione più nativa e potente del boot da ZFS.
+
+### Vantaggi ZFSBootMenu
+   - **Boot ibrido rEFInd+ZBM** - Setup transitorio con rEFInd che chiama ZBM (doppio passaggio ma funzionale)
+   - **Snapshot browsing** - Visualizza e boot da qualsiasi snapshot
+   - **Kernel negli snapshot** - Sistema completamente atomico
+   - **Clone automatico** - Crea BE da snapshot al volo
+   - **Recovery integrata** - Shell di emergenza sempre disponibile
+
+## Installazione ZFSBootMenu
+
+### Requisiti
+   - **ESP in `/boot/efi`** - ZBM richiede partizione EFI accessibile
+   - **Kernel in snapshot** - Migrazione da `/boot` separato a `/boot` nel root ZFS
+
+### Setup Iniziale
+
+   ```bash
+# 1. Installa ZFSBootMenu (manuale per verifica file)
+# Scaricare pacchetto AUR e scompattare manualmente
+# Verificare presenza file in /boot/efi/EFI/zbm
+
+# 2. Configurazione base
+   sudo tee /etc/zfsbootmenu/config.yaml > /dev/null << 'EOF'
+   Global:
+     ManageImages: true
+     BootMountPoint: /boot/efi
+     ImageDir: /EFI/zbm
+   Components:
+     Enabled: false
+EFI:
+  ImageDir: /EFI/zbm
+  Versions: 3
+  Enabled: true
+Kernel:
+  CommandLine: rw nvidia_drm.modeset=1 nvidia_drm.fbdev=1 intel_iommu=on iommu=pt
+EOF
+
+# 3. Genera immagini ZBM
+sudo generate-zbm
+
+# 4. Crea entry UEFI
+sudo efibootmgr --create --disk /dev/nvme0n1 --part 1 --label "ZFSBootMenu" --loader '\EFI\zbm\vmlinuz.EFI'
+```
+
+### Migrazione Kernel negli Snapshot
+
+**IMPORTANTE:** Il kernel deve essere incluso negli snapshot per garantire coerenza sistema-kernel. La configurazione iniziale aveva ESP montata in `/boot` (non `/boot/efi`).
+
+```bash
+# Rimonta ESP in /boot/efi per ZBM
+sudo umount /boot
+sudo mkdir -p /boot/efi
+sudo mount /dev/nvme0n1p1 /boot/efi
+
+# Aggiorna fstab
+sudo sed -i 's|/boot|/boot/efi|g' /etc/fstab
+
+# Installa kernel nel root ZFS
+sudo pacman -S linux linux-headers
+```
+
+## Configurazione ZFS Properties
+
+### Property Essenziali per ZBM
+
+```bash
+# Abilita dataset come bootable
+sudo zfs set org.zfsbootmenu:commandline="rw nvidia_drm.modeset=1 nvidia_drm.fbdev=1 intel_iommu=on iommu=pt" zcalvuz/ROOT/calvuz
+
+# Per BE con mountpoint=legacy (se necessario)
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/be-name
+```
+
+### Property Opzionali
+
+```bash
+# Titolo personalizzato nel menu
+sudo zfs set org.zfsbootmenu:title="Sistema Principale" zcalvuz/ROOT/calvuz
+
+# Timeout kernel specifico
+sudo zfs set org.zfsbootmenu:keysource="file:///etc/zfs/keys/dataset" zcalvuz/ROOT/calvuz
+```
+
+## Gestione Boot Environments
+
+### Creazione BE da Snapshot
+
+```bash
+# Metodo 1: Via ZBM (automatico)
+# 1. Boot in ZBM
+# 2. Seleziona snapshot
+# 3. ZBM crea clone automaticamente
+
+# Metodo 2: Manuale
+sudo zfs clone zcalvuz/ROOT/calvuz@snapshot-name zcalvuz/ROOT/new-be-name
+sudo zfs set mountpoint=legacy zcalvuz/ROOT/new-be-name
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/new-be-name
+sudo zfs set org.zfsbootmenu:commandline="rw nvidia_drm.modeset=1 nvidia_drm.fbdev=1" zcalvuz/ROOT/new-be-name
+```
+
+### Configurazione Mountpoint per BE
+
+**Solo un BE alla volta può avere `mountpoint=/`:**
+
+```bash
+# BE attivo
+sudo zfs set mountpoint=/ zcalvuz/ROOT/calvuz
+sudo zfs set canmount=on zcalvuz/ROOT/calvuz
+
+# BE alternative
+sudo zfs set mountpoint=legacy zcalvuz/ROOT/alternative-be
+sudo zfs set canmount=noauto zcalvuz/ROOT/alternative-be
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/alternative-be
+```
+
+### Switch tra Boot Environments
+
+⚠️ **ATTENZIONE:** Switch mountpoint può causare freeze se fatto dal sistema live. Raccomandato farlo da rescue shell ZBM.
+
+```bash
+# Metodo 1: Da rescue shell ZBM (raccomandato e sicuro)
+# 1. Boot ZBM → rescue shell
+# 2. Switch mountpoint in ambiente non montato
+zfs set mountpoint=legacy zcalvuz/ROOT/calvuz
+zfs set canmount=noauto zcalvuz/ROOT/calvuz
+zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/calvuz
+
+zfs set mountpoint=/ zcalvuz/ROOT/new-main-be
+zfs set canmount=on zcalvuz/ROOT/new-main-be
+
+# Metodo 2: Sistema live (SPERIMENTALE - rischio freeze)
+# ⚠️ ORDINE CRITICO: mai due BE con mountpoint=/ contemporaneamente
+sudo zfs set mountpoint=legacy zcalvuz/ROOT/calvuz  # PRIMA disattiva
+sudo zfs set canmount=noauto zcalvuz/ROOT/calvuz
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/calvuz
+
+sudo zfs set mountpoint=/ zcalvuz/ROOT/new-main-be  # POI attiva
+sudo zfs set canmount=on zcalvuz/ROOT/new-main-be
+
+# Metodo 3: Cambio bootfs pool
+sudo zpool set bootfs=zcalvuz/ROOT/new-main-be zcalvuz
+```
+
+## Workflow Aggiornamenti Sicuri
+
+### Snapshot Pre-Aggiornamento
+
+```bash
+# Snapshot coordinato sistema + home
+sudo zfs snapshot -r zcalvuz@pre-update-$(date +%Y%m%d-%H%M)
+```
+
+### Test su Clone (Opzionale)
+
+```bash
+# 1. Crea clone per test
+sudo zfs clone zcalvuz/ROOT/calvuz@pre-update-XXXXXX zcalvuz/ROOT/test-updates
+
+# 2. Configura clone per boot
+sudo zfs set mountpoint=legacy zcalvuz/ROOT/test-updates
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/test-updates
+sudo zfs set org.zfsbootmenu:commandline="rw nvidia_drm.modeset=1 nvidia_drm.fbdev=1" zcalvuz/ROOT/test-updates
+
+# 3. Test aggiornamenti su clone
+# 4. Se OK → applica su sistema principale
+# 5. Se NOK → destroy clone
+```
+
+## Finalizzazione Clone di Successo
+
+### Quando un aggiornamento testato su clone funziona perfettamente:
+
+```bash
+# 1. Disattiva BE principale
+sudo zfs set mountpoint=legacy zcalvuz/ROOT/calvuz
+sudo zfs set canmount=noauto zcalvuz/ROOT/calvuz
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/calvuz
+
+# 2. Promuovi clone a principale
+sudo zfs set mountpoint=/ zcalvuz/ROOT/test-updates
+sudo zfs set canmount=on zcalvuz/ROOT/test-updates
+
+# 3. Rinomina per chiarezza
+sudo zfs rename zcalvuz/ROOT/calvuz zcalvuz/ROOT/calvuz-old-$(date +%Y%m%d)
+sudo zfs rename zcalvuz/ROOT/test-updates zcalvuz/ROOT/calvuz
+
+# 4. Cleanup BE vecchio (se sicuro)
+sudo zfs destroy -r zcalvuz/ROOT/calvuz-old-XXXXXX
+```
+
+## Recovery di Emergenza
+
+### Boot da Snapshot (Temporaneo)
+
+1. Boot in ZBM
+2. Seleziona snapshot desiderato
+3. Boot temporaneo (non permanente)
+
+### Rollback Home (se necessario)
+
+```bash
+# Se aggiornamento modifica configurazioni in /home
+sudo zfs rollback zcalvuz/data/home@pre-update-XXXXXX
+```
+
+## Note Importanti
+
+- **ESP obbligatoria in `/boot/efi`** - ZBM non funziona con `/boot` ZFS
+- **Kernel negli snapshot** - Garantisce coerenza kernel-sistema
+- **Un solo BE con `mountpoint=/`** - Evita conflitti
+- **Property ZBM** - Necessarie per BE con mountpoint=legacy
+- **Snapshot coordinati** - Sistema e home sincronizzati per recovery completa
+
+## Troubleshooting
+
+### BE non appare in ZBM
+```bash
+# Verifica property
+zfs get org.zfsbootmenu:active,org.zfsbootmenu:commandline zcalvuz/ROOT/be-name
+
+# Per mountpoint=legacy
+sudo zfs set org.zfsbootmenu:active=on zcalvuz/ROOT/be-name
+```
+
+### "Nessun pool da importare"
+- Conflitto mountpoint `/` tra più BE
+- Verificare un solo BE con `mountpoint=/` e `canmount=on`
+
+### Freeze con Plymouth
+Se il sistema si blocca con Plymouth abilitato:
+```bash
+# Disabilita Plymouth temporaneamente nei parametri kernel
+plymouth.enable=0 disablehooks=plymouth
+
+# Assicurati di avere il framebuffer corretto per Plymouth
+# Nel caso di NVIDIA, aggiungi ai parametri kernel:
+org.zfsbootmenu:commandline="rw nvidia_drm.modeset=1 nvidia_drm.fbdev=1 ..."
+```
+
+
+
+# ZFS Management Script v.1
 
 Script bash avanzato per la gestione automatizzata di snapshot ZFS e Boot Environment con integrazione rEFInd per sistemi Arch Linux.
 
